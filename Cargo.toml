@@ -1,0 +1,25 @@
+[package]
+name = "chitin"
+version = "0.1.0"
+edition = "2024"
+description = "Fast Rust CLI for openclaw - the exoskeleton that makes it snappy"
+license = "MIT"
+repository = "https://github.com/peakxl/chitin"
+
+[[bin]]
+name = "chitin"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+which = "7"
+dirs = "6"
+anyhow = "1"
+atty = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

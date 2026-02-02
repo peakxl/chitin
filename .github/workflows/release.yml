@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      openclaw_version:
+        description: 'OpenClaw version to track (e.g., 2026.1.30)'
+        required: true
+        type: string
+  schedule:
+    # Check for new releases daily at 00:00 UTC
+    - cron: '0 0 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      openclaw_version: ${{ steps.check.outputs.openclaw_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for new OpenClaw release
+        id: check
+        run: |
+          if [ -n "${{ inputs.openclaw_version }}" ]; then
+            # Manual trigger with specific version
+            OPENCLAW_VERSION="${{ inputs.openclaw_version }}"
+          else
+            # Get latest release tag from upstream
+            OPENCLAW_VERSION=$(curl -s https://api.github.com/repos/openclaw/openclaw/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+          fi
+
+          echo "openclaw_version=$OPENCLAW_VERSION" >> $GITHUB_OUTPUT
+
+          # Check if we already have a release for this version
+          CURRENT_VERSION=$(grep 'OPENCLAW_VERSION' src/main.rs | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+          if [ "$OPENCLAW_VERSION" != "$CURRENT_VERSION" ]; then
+            echo "New OpenClaw version detected: $OPENCLAW_VERSION (current: $CURRENT_VERSION)"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "Already tracking OpenClaw $OPENCLAW_VERSION"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          fi
+
+  update-version:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      chitin_version: ${{ steps.version.outputs.chitin_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update OpenClaw version in source
+        id: version
+        run: |
+          OPENCLAW_VERSION="${{ needs.check-upstream.outputs.openclaw_version }}"
+
+          # Update OPENCLAW_VERSION in main.rs
+          sed -i "s/OPENCLAW_VERSION: &str = \".*\"/OPENCLAW_VERSION: \&str = \"$OPENCLAW_VERSION\"/" src/main.rs
+
+          # Get chitin version from Cargo.toml
+          CHITIN_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "chitin_version=$CHITIN_VERSION" >> $GITHUB_OUTPUT
+
+          echo "Updated to track OpenClaw $OPENCLAW_VERSION"
+
+      - name: Upload updated source
+        uses: actions/upload-artifact@v4
+        with:
+          name: updated-source
+          path: src/
+
+  build:
+    needs: [check-upstream, update-version]
+    if: needs.check-upstream.outputs.should_release == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: chitin-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: chitin-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: chitin-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: chitin-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download updated source
+        uses: actions/download-artifact@v4
+        with:
+          name: updated-source
+          path: src/
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/chitin dist/${{ matrix.name }}
+          chmod +x dist/${{ matrix.name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}
+
+  release:
+    needs: [check-upstream, update-version, build]
+    if: needs.check-upstream.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/chitin-*; do
+            if [ -d "$dir" ]; then
+              name=$(basename "$dir")
+              cp "$dir/$name" "release/$name"
+              chmod +x "release/$name"
+            fi
+          done
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.update-version.outputs.chitin_version }}-openclaw${{ needs.check-upstream.outputs.openclaw_version }}
+          name: Chitin ${{ needs.update-version.outputs.chitin_version }} (OpenClaw ${{ needs.check-upstream.outputs.openclaw_version }})
+          body: |
+            Chitin release tracking OpenClaw v${{ needs.check-upstream.outputs.openclaw_version }}
+
+            ## Downloads
+
+            | Platform | Architecture | Download |
+            |----------|--------------|----------|
+            | Linux | x86_64 | `chitin-linux-x86_64` |
+            | Linux | aarch64 | `chitin-linux-aarch64` |
+            | macOS | x86_64 (Intel) | `chitin-macos-x86_64` |
+            | macOS | aarch64 (Apple Silicon) | `chitin-macos-aarch64` |
+
+            ## Installation
+
+            ```bash
+            # Download for your platform
+            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ needs.update-version.outputs.chitin_version }}-openclaw${{ needs.check-upstream.outputs.openclaw_version }}/chitin-linux-x86_64
+            chmod +x chitin-linux-x86_64
+            sudo mv chitin-linux-x86_64 /usr/local/bin/chitin
+            ```
+
+            ## Upstream
+
+            - OpenClaw release: https://github.com/openclaw/openclaw/releases/tag/v${{ needs.check-upstream.outputs.openclaw_version }}
+          files: release/*
+          draft: false
+          prerelease: false
+
+  update-source:
+    needs: [check-upstream, update-version, release]
+    if: needs.check-upstream.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download updated source
+        uses: actions/download-artifact@v4
+        with:
+          name: updated-source
+          path: src/
+
+      - name: Commit version update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src/main.rs
+          git commit -m "Track OpenClaw v${{ needs.check-upstream.outputs.openclaw_version }}" || echo "No changes to commit"
+          git push
