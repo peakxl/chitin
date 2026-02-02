@@ -5,8 +5,13 @@ on:
     inputs:
       openclaw_version:
         description: 'OpenClaw version to track (e.g., 2026.1.30)'
-        required: true
+        required: false
         type: string
+      force:
+        description: 'Force release even if tag exists'
+        required: false
+        type: boolean
+        default: false
   schedule:
     # Check for new releases daily at 00:00 UTC
     - cron: '0 0 * * *'
@@ -15,72 +20,62 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check-upstream:
+  check-release:
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
       openclaw_version: ${{ steps.check.outputs.openclaw_version }}
+      chitin_version: ${{ steps.check.outputs.chitin_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      needs_source_update: ${{ steps.check.outputs.needs_source_update }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check for new OpenClaw release
+      - name: Determine versions and check release
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # Get OpenClaw version (from input or upstream)
           if [ -n "${{ inputs.openclaw_version }}" ]; then
-            # Manual trigger with specific version
             OPENCLAW_VERSION="${{ inputs.openclaw_version }}"
           else
-            # Get latest release tag from upstream
             OPENCLAW_VERSION=$(curl -s https://api.github.com/repos/openclaw/openclaw/releases/latest | jq -r '.tag_name' | sed 's/^v//')
           fi
-
           echo "openclaw_version=$OPENCLAW_VERSION" >> $GITHUB_OUTPUT
-
-          # Check if we already have a release for this version
-          CURRENT_VERSION=$(grep 'OPENCLAW_VERSION' src/main.rs | head -1 | sed 's/.*"\(.*\)".*/\1/')
-
-          if [ "$OPENCLAW_VERSION" != "$CURRENT_VERSION" ]; then
-            echo "New OpenClaw version detected: $OPENCLAW_VERSION (current: $CURRENT_VERSION)"
-            echo "should_release=true" >> $GITHUB_OUTPUT
-          else
-            echo "Already tracking OpenClaw $OPENCLAW_VERSION"
-            echo "should_release=false" >> $GITHUB_OUTPUT
-          fi
-
-  update-version:
-    needs: check-upstream
-    if: needs.check-upstream.outputs.should_release == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      chitin_version: ${{ steps.version.outputs.chitin_version }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Update OpenClaw version in source
-        id: version
-        run: |
-          OPENCLAW_VERSION="${{ needs.check-upstream.outputs.openclaw_version }}"
-
-          # Update OPENCLAW_VERSION in main.rs
-          sed -i "s/OPENCLAW_VERSION: &str = \".*\"/OPENCLAW_VERSION: \&str = \"$OPENCLAW_VERSION\"/" src/main.rs
 
           # Get chitin version from Cargo.toml
           CHITIN_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "chitin_version=$CHITIN_VERSION" >> $GITHUB_OUTPUT
 
-          echo "Updated to track OpenClaw $OPENCLAW_VERSION"
+          # Determine release tag
+          RELEASE_TAG="v${CHITIN_VERSION}-openclaw${OPENCLAW_VERSION}"
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Upload updated source
-        uses: actions/upload-artifact@v4
-        with:
-          name: updated-source
-          path: src/
+          # Check if source needs updating
+          CURRENT_OPENCLAW=$(grep 'OPENCLAW_VERSION' src/main.rs | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$OPENCLAW_VERSION" != "$CURRENT_OPENCLAW" ]; then
+            echo "needs_source_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_source_update=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Check if release already exists
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "Force release requested"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          elif gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "Will create release $RELEASE_TAG"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
 
   build:
-    needs: [check-upstream, update-version]
-    if: needs.check-upstream.outputs.should_release == 'true'
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true'
     strategy:
       matrix:
         include:
@@ -101,11 +96,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download updated source
-        uses: actions/download-artifact@v4
-        with:
-          name: updated-source
-          path: src/
+      - name: Update OpenClaw version if needed
+        if: needs.check-release.outputs.needs_source_update == 'true'
+        run: |
+          sed -i.bak "s/OPENCLAW_VERSION: &str = \".*\"/OPENCLAW_VERSION: \&str = \"${{ needs.check-release.outputs.openclaw_version }}\"/" src/main.rs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -138,8 +132,8 @@ jobs:
           path: dist/${{ matrix.name }}
 
   release:
-    needs: [check-upstream, update-version, build]
-    if: needs.check-upstream.outputs.should_release == 'true'
+    needs: [check-release, build]
+    if: needs.check-release.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -167,10 +161,10 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ needs.update-version.outputs.chitin_version }}-openclaw${{ needs.check-upstream.outputs.openclaw_version }}
-          name: Chitin ${{ needs.update-version.outputs.chitin_version }} (OpenClaw ${{ needs.check-upstream.outputs.openclaw_version }})
+          tag_name: ${{ needs.check-release.outputs.release_tag }}
+          name: Chitin ${{ needs.check-release.outputs.chitin_version }} (OpenClaw ${{ needs.check-release.outputs.openclaw_version }})
           body: |
-            Chitin release tracking OpenClaw v${{ needs.check-upstream.outputs.openclaw_version }}
+            Chitin release tracking OpenClaw v${{ needs.check-release.outputs.openclaw_version }}
 
             ## Downloads
 
@@ -185,21 +179,21 @@ jobs:
 
             ```bash
             # Download for your platform
-            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ needs.update-version.outputs.chitin_version }}-openclaw${{ needs.check-upstream.outputs.openclaw_version }}/chitin-linux-x86_64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.check-release.outputs.release_tag }}/chitin-linux-x86_64
             chmod +x chitin-linux-x86_64
             sudo mv chitin-linux-x86_64 /usr/local/bin/chitin
             ```
 
             ## Upstream
 
-            - OpenClaw release: https://github.com/openclaw/openclaw/releases/tag/v${{ needs.check-upstream.outputs.openclaw_version }}
+            - OpenClaw release: https://github.com/openclaw/openclaw/releases/tag/v${{ needs.check-release.outputs.openclaw_version }}
           files: release/*
           draft: false
           prerelease: false
 
   update-source:
-    needs: [check-upstream, update-version, release]
-    if: needs.check-upstream.outputs.should_release == 'true'
+    needs: [check-release, release]
+    if: needs.check-release.outputs.should_release == 'true' && needs.check-release.outputs.needs_source_update == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -207,16 +201,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download updated source
-        uses: actions/download-artifact@v4
-        with:
-          name: updated-source
-          path: src/
-
-      - name: Commit version update
+      - name: Update and commit version
         run: |
+          sed -i "s/OPENCLAW_VERSION: &str = \".*\"/OPENCLAW_VERSION: \&str = \"${{ needs.check-release.outputs.openclaw_version }}\"/" src/main.rs
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add src/main.rs
-          git commit -m "Track OpenClaw v${{ needs.check-upstream.outputs.openclaw_version }}" || echo "No changes to commit"
+          git commit -m "Track OpenClaw v${{ needs.check-release.outputs.openclaw_version }}"
           git push
