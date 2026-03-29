@@ -10,7 +10,7 @@ mod runtime;
 use cache::HelpCache;
 use runtime::RuntimeDetector;
 
-const OPENCLAW_VERSION: &str = "2026.3.24";
+const OPENCLAW_VERSION: &str = "2026.3.28";
 const CHITIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Rebrand help text for chitin CLI
